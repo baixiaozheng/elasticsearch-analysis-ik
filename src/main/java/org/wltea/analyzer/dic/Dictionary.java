@@ -38,6 +38,7 @@ import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.security.AccessController;
 import java.security.PrivilegedAction;
+import java.sql.*;
 import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -45,7 +46,6 @@ import java.util.concurrent.TimeUnit;
 
 import org.apache.http.Header;
 import org.apache.http.HttpEntity;
-import org.apache.http.client.ClientProtocolException;
 import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
@@ -155,6 +155,8 @@ public class Dictionary {
 					singleton.loadPrepDict();
 					singleton.loadStopWordDict();
 
+					pool.execute(() -> new HotDictReloadThread().initial());
+
 					if(cfg.isEnableRemoteDict()){
 						// 建立监控线程
 						for (String location : singleton.getRemoteExtDictionarys()) {
@@ -174,21 +176,23 @@ public class Dictionary {
 	private void walkFileTree(List<String> files, Path path) {
 		if (Files.isRegularFile(path)) {
 			files.add(path.toString());
-		} else if (Files.isDirectory(path)) try {
-			Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
-				@Override
-				public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-					files.add(file.toString());
-					return FileVisitResult.CONTINUE;
-				}
-				@Override
-				public FileVisitResult visitFileFailed(Path file, IOException e) {
-					logger.error("[Ext Loading] listing files", e);
-					return FileVisitResult.CONTINUE;
-				}
-			});
-		} catch (IOException e) {
-			logger.error("[Ext Loading] listing files", e);
+		} else if (Files.isDirectory(path)) {
+			try {
+				Files.walkFileTree(path, new SimpleFileVisitor<Path>() {
+					@Override
+					public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+						files.add(file.toString());
+						return FileVisitResult.CONTINUE;
+					}
+					@Override
+					public FileVisitResult visitFileFailed(Path file, IOException e) {
+						logger.error("[Ext Loading] listing files", e);
+						return FileVisitResult.CONTINUE;
+					}
+				});
+			} catch (IOException e) {
+				logger.error("[Ext Loading] listing files", e);
+			}
 		} else {
 			logger.warn("[Ext Loading] file not found: " + path);
 		}
@@ -200,17 +204,22 @@ public class Dictionary {
 					new InputStreamReader(is, "UTF-8"), 512);
 			String word = br.readLine();
 			if (word != null) {
-				if (word.startsWith("\uFEFF"))
+				if (word.startsWith("\uFEFF")) {
 					word = word.substring(1);
+				}
 				for (; word != null; word = br.readLine()) {
 					word = word.trim();
-					if (word.isEmpty()) continue;
+					if (word.isEmpty()) {
+						continue;
+					}
 					dict.fillSegment(word.toCharArray());
 				}
 			}
 		} catch (FileNotFoundException e) {
 			logger.error("ik-analyzer: " + name + " not found", e);
-			if (critical) throw new RuntimeException("ik-analyzer: " + name + " not found!!!", e);
+			if (critical) {
+				throw new RuntimeException("ik-analyzer: " + name + " not found!!!", e);
+			}
 		} catch (IOException e) {
 			logger.error("ik-analyzer: " + name + " loading failed", e);
 		}
@@ -391,6 +400,8 @@ public class Dictionary {
 		this.loadExtDict();
 		// 加载远程自定义词库
 		this.loadRemoteExtDict();
+		//从数据库加载
+		this.loadMysqlExtDict();
 	}
 
 	/**
@@ -530,6 +541,7 @@ public class Dictionary {
 			}
 		}
 
+		this.loadMySQLStopwordDict();
 	}
 
 	/**
@@ -572,5 +584,127 @@ public class Dictionary {
 		_StopWords = tmpDict._StopWords;
 		logger.info("reload ik dict finished.");
 	}
+	private static Properties prop = new Properties();
+	static {
+		try {
+			Class.forName("com.mysql.cj.jdbc.Driver");
+		} catch (ClassNotFoundException e){
+			logger.error("error",e);
+		}
+	}
 
+	private void loadMysqlExtDict(){
+		Connection conn = null;
+		Statement stmt = null;
+		ResultSet rs = null;
+
+		try {
+			Path file = PathUtils.get(getDictRoot(), "jdbc.properties");
+			prop.load(new FileInputStream(file.toFile()));
+
+//			logger.info("jdbc-reload.properties");
+//			for (Object key : prop.keySet()) {
+//				logger.info(key + "=" + prop.getProperty(String.valueOf(key)));
+//			}
+
+			logger.info("query hot dict from mysql，" + prop.getProperty("jdbc.reload.sql"));
+			conn = DriverManager.getConnection(
+					prop.getProperty("jdbc.url"),
+					prop.getProperty("jdbc.user"),
+					prop.getProperty("jdbc.password")
+			);
+			stmt = conn.createStatement();
+			rs = stmt.executeQuery(prop.getProperty("jdbc.reload.hotwords.sql"));
+
+			while (rs.next()){
+				String word = rs.getString("words");
+				logger.info("hot word from mysql：" + word);
+				_MainDict.fillSegment(word.trim().toCharArray());
+			}
+			Thread.sleep(Integer.valueOf(String.valueOf(prop.get("jdbc.reload.interval"))));
+		} catch (Exception e){
+			logger.error("error",e);
+		} finally {
+			if (rs != null) {
+				try {
+					rs.close();
+				} catch (SQLException e){
+					logger.error("error",e);
+				}
+			}
+
+			if (stmt != null) {
+				try {
+					stmt.close();
+				} catch (SQLException e){
+					logger.error("error",e);
+				}
+			}
+
+			if (conn != null) {
+				try {
+					conn.close();
+				} catch (SQLException e) {
+					logger.error("error",e);
+				}
+			}
+		}
+	}
+
+	private void loadMySQLStopwordDict() {
+		Connection conn = null;
+		Statement stmt = null;
+		ResultSet rs = null;
+
+		try {
+			Path file = PathUtils.get(getDictRoot(), "jdbc.properties");
+			prop.load(new FileInputStream(file.toFile()));
+
+			logger.info("[==========]jdbc-reload.properties");
+//			for(Object key : prop.keySet()) {
+//				logger.info("[==========]" + key + "=" + prop.getProperty(String.valueOf(key)));
+//			}
+
+			logger.info("[==========]query hot stopword dict from mysql, " + prop.getProperty("jdbc.reload.stopword.sql") + "......");
+
+			conn = DriverManager.getConnection(
+					prop.getProperty("jdbc.url"),
+					prop.getProperty("jdbc.user"),
+					prop.getProperty("jdbc.password"));
+			stmt = conn.createStatement();
+			rs = stmt.executeQuery(prop.getProperty("jdbc.reload.stopwords.sql"));
+
+			while(rs.next()) {
+				String theWord = rs.getString("words");
+				logger.info("[==========]hot stopword from mysql: " + theWord);
+				_StopWords.fillSegment(theWord.trim().toCharArray());
+			}
+
+			Thread.sleep(Integer.valueOf(String.valueOf(prop.get("jdbc.reload.interval"))));
+		} catch (Exception e) {
+			logger.error("erorr", e);
+		} finally {
+			if(rs != null) {
+				try {
+					rs.close();
+				} catch (SQLException e) {
+					logger.error("error", e);
+				}
+			}
+			if(stmt != null) {
+				try {
+					stmt.close();
+				} catch (SQLException e) {
+					logger.error("error", e);
+				}
+			}
+			if(conn != null) {
+				try {
+					conn.close();
+				} catch (SQLException e) {
+					logger.error("error", e);
+				}
+			}
+		}
+	}
 }
